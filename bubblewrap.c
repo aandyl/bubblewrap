@@ -72,6 +72,8 @@ int opt_block_fd = -1;
 int opt_info_fd = -1;
 int opt_seccomp_fd = -1;
 char *opt_sandbox_hostname = NULL;
+/* Signal to send to the child when the parent exits (if 0, don't send one) */
+int opt_on_parent_exit_signal = 0;
 
 typedef enum {
   SETUP_BIND_MOUNT,
@@ -217,6 +219,7 @@ usage (int ecode, FILE *out)
            "    --block-fd FD                Block on FD until some data to read is available\n"
            "    --info-fd FD                 Write information about the running container to FD\n"
            "    --new-session                Create a new terminal session\n"
+           "    --on-parent-exit SIGNAL      Send the sandbox process SIGNAL when the parent exits\n"
           );
   exit (ecode);
 }
@@ -294,7 +297,7 @@ propagate_exit_status (int status)
  * pid 1 via a signalfd for SIGCHLD, and exit with an error in this case.
  * This is to catch e.g. problems during setup. */
 static void
-monitor_child (int event_fd, pid_t child_pid)
+monitor_child (int pipe_fd, pid_t child_pid)
 {
   int res;
   uint64_t val;
@@ -304,7 +307,7 @@ monitor_child (int event_fd, pid_t child_pid)
   struct pollfd fds[2];
   int num_fds;
   struct signalfd_siginfo fdsi;
-  int dont_close[] = { event_fd, -1 };
+  int dont_close[] = { pipe_fd, -1 };
   pid_t died_pid;
   int died_status;
 
@@ -322,9 +325,9 @@ monitor_child (int event_fd, pid_t child_pid)
   num_fds = 1;
   fds[0].fd = signal_fd;
   fds[0].events = POLLIN;
-  if (event_fd != -1)
+  if (pipe_fd != -1)
     {
-      fds[1].fd = event_fd;
+      fds[1].fd = pipe_fd;
       fds[1].events = POLLIN;
       num_fds++;
     }
@@ -339,9 +342,9 @@ monitor_child (int event_fd, pid_t child_pid)
       /* Always read from the eventfd first, if pid 2 died then pid 1 often
        * dies too, and we could race, reporting that first and we'd lose
        * the real exit status. */
-      if (event_fd != -1)
+      if (pipe_fd != -1)
         {
-          s = read (event_fd, &val, 8);
+          s = read (pipe_fd, &val, 8);
           if (s == -1 && errno != EINTR && errno != EAGAIN)
             die_with_error ("read eventfd");
           else if (s == 8)
@@ -375,10 +378,32 @@ monitor_child (int event_fd, pid_t child_pid)
  * When there are no other processes in the sandbox the wait will return
  * ECHILD, and we then exit pid 1 to clean up the sandbox. */
 static int
-do_init (int event_fd, pid_t initial_pid, struct sock_fprog *seccomp_prog)
+do_init (int pipe_fd, pid_t initial_pid, struct sock_fprog *seccomp_prog)
 {
+  int res;
   int initial_exit_status = 1;
   LockFile *lock;
+  int signal_fd;
+  sigset_t mask;
+  struct pollfd fds[2];
+  int num_fds;
+
+  sigemptyset (&mask);
+  sigaddset (&mask, SIGCHLD);
+
+  signal_fd = signalfd (-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+  if (signal_fd == -1)
+    die_with_error ("Can't create signalfd");
+
+  num_fds = 1;
+  fds[0].fd = signal_fd;
+  fds[0].events = POLLIN;
+  if (pipe_fd != -1 && opt_on_parent_exit_signal)
+    {
+      fds[1].fd = pipe_fd;
+      fds[1].events = 0; /* errors only */
+      num_fds++;
+    }
 
   for (lock = lock_files; lock != NULL; lock = lock->next)
     {
@@ -405,28 +430,43 @@ do_init (int event_fd, pid_t initial_pid, struct sock_fprog *seccomp_prog)
 
   while (TRUE)
     {
+      fds[0].revents = fds[1].revents = 0;
+      res = poll (fds, num_fds, -1);
+      if (res == -1 && errno != EINTR)
+        die_with_error ("poll");
+
+      if (num_fds == 2 && fds[1].revents)
+        {
+          __debug__ (("parent closed status fd\n"));
+          kill (0, opt_on_parent_exit_signal);
+	  num_fds = 1;
+        }
+
       pid_t child;
       int status;
 
-      child = wait (&status);
-      if (child == initial_pid && event_fd != -1)
+      if (fds[0].revents & POLLIN)
         {
-          uint64_t val;
-          int res UNUSED;
+          child = wait (&status);
+          if (child == initial_pid && pipe_fd != -1)
+            {
+              uint64_t val;
+              int res UNUSED;
 
-          initial_exit_status = propagate_exit_status (status);
+              initial_exit_status = propagate_exit_status (status);
 
-          val = initial_exit_status + 1;
-          res = write (event_fd, &val, 8);
-          /* Ignore res, if e.g. the parent died and closed event_fd
-             we don't want to error out here */
-        }
+              val = initial_exit_status + 1;
+              res = write (pipe_fd, &val, 8);
+              /* Ignore res, if e.g. the parent died and closed pipe_fd
+                 we don't want to error out here */
+            }
 
-      if (child == -1 && errno != EINTR)
-        {
-          if (errno != ECHILD)
-            die_with_error ("init wait()");
-          break;
+          if (child == -1 && errno != EINTR)
+            {
+              if (errno != ECHILD)
+                die_with_error ("init wait()");
+              break;
+            }
         }
     }
 
@@ -1615,6 +1655,23 @@ parse_args_recurse (int    *argcp,
         {
           opt_new_session = TRUE;
         }
+      else if (strcmp (arg, "--on-parent-exit") == 0)
+        {
+          int the_signal;
+          char *endptr;
+
+          if (argc < 2)
+            die ("--on-parent-exit takes an argument");
+
+          the_signal = strtol (argv[1], &endptr, 10);
+          if (argv[1][0] == 0 || endptr[0] != 0 || the_signal < 0)
+            die ("Invalid on-parent-exit signal: %s", argv[1]);
+
+          opt_on_parent_exit_signal = the_signal;
+
+          argv += 1;
+          argc -= 1;
+        }
       else if (*arg == '-')
         {
           die ("Unknown option %s", arg);
@@ -1673,7 +1730,7 @@ main (int    argc,
   int clone_flags;
   char *old_cwd = NULL;
   pid_t pid;
-  int event_fd = -1;
+  int pipe_fd[2] = {-1, -1};
   int child_wait_fd = -1;
   const char *new_cwd;
   uid_t ns_uid;
@@ -1786,9 +1843,8 @@ main (int    argc,
 
   if (opt_unshare_pid)
     {
-      event_fd = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
-      if (event_fd == -1)
-        die_with_error ("eventfd()");
+      if (pipe2(pipe_fd, O_CLOEXEC | O_NONBLOCK) == -1)
+        die_with_error ("pipe()");
     }
 
   /* We block sigchild here so that we can use signalfd in the monitor. */
@@ -1880,7 +1936,7 @@ main (int    argc,
           close (opt_info_fd);
         }
 
-      monitor_child (event_fd, pid);
+      monitor_child (pipe_fd[PIPE_READ_END], pid);
       exit (0); /* Should not be reached, but better safe... */
     }
 
@@ -2128,7 +2184,7 @@ main (int    argc,
 
       if (pid != 0)
         {
-          /* Close fds in pid 1, except stdio and optionally event_fd
+          /* Close fds in pid 1, except stdio and optionally pipe_fd
              (for syncing pid 2 lifetime with monitor_child) and
              opt_sync_fd (for syncing sandbox lifetime with outside
              process).
@@ -2136,15 +2192,15 @@ main (int    argc,
           {
             int dont_close[3];
             int j = 0;
-            if (event_fd != -1)
-              dont_close[j++] = event_fd;
+            if (pipe_fd[PIPE_WRITE_END] != -1)
+              dont_close[j++] = pipe_fd[PIPE_WRITE_END];
             if (opt_sync_fd != -1)
               dont_close[j++] = opt_sync_fd;
             dont_close[j++] = -1;
             fdwalk (proc_fd, close_extra_fds, dont_close);
           }
 
-          return do_init (event_fd, pid, seccomp_data != NULL ? &seccomp_prog : NULL);
+          return do_init (pipe_fd[PIPE_WRITE_END], pid, seccomp_data != NULL ? &seccomp_prog : NULL);
         }
     }
 
@@ -2158,6 +2214,15 @@ main (int    argc,
 
   /* We want sigchild in the child */
   unblock_sigchild ();
+
+  if (!opt_unshare_pid && opt_on_parent_exit_signal)
+    {
+      /* If we're in the same PID namespace, then we can kill the child
+       * automatically when the parent dies */
+
+      if (prctl (PR_SET_PDEATHSIG, opt_on_parent_exit_signal) != 0)
+        die_with_error ("prctl(PR_SET_PDEATHSIG)");
+    }
 
   if (seccomp_data != NULL &&
       prctl (PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &seccomp_prog) != 0)
